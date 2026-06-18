@@ -31,8 +31,23 @@ class Layer:
         self._training: bool = True
 
     def train(self, mode: bool = True):
-        """切换训练/推理模式"""
+        """递归切换训练/推理模式（包括所有子层）"""
         self._training = mode
+        # 递归处理作为属性的子层
+        for attr_name in dir(self):
+            if attr_name.startswith('_'):
+                continue
+            try:
+                attr = getattr(self, attr_name)
+                if isinstance(attr, Layer):
+                    attr.train(mode)
+            except:
+                pass
+        # 递归处理 blocks 列表
+        if hasattr(self, 'blocks'):
+            for block in self.blocks:
+                if isinstance(block, Layer):
+                    block.train(mode)
         return self
 
     def eval(self):

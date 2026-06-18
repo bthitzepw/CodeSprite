@@ -9,10 +9,22 @@
 - 确保所有代码语法字符（括号、运算符、分号等）独立编码
 """
 
-import torch
 import json
 import re
-from torch.utils.data import Dataset
+
+# torch 是可选依赖（仅用于训练时的 Dataset/DataLoader）
+# 纯推理场景（仅用 CodeTokenizer）不需要 PyTorch
+try:
+    import torch
+    from torch.utils.data import Dataset
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    torch = None
+
+    class Dataset:  # type: ignore[no-redef]
+        """占位符 — 安装 PyTorch 后自动使用真实 Dataset"""
+        pass
 
 
 class CodeTokenizer:
@@ -54,6 +66,46 @@ class CodeTokenizer:
         '"""',        # 三引号
         "'''",        # 三单引号
         '${',         # 模板字符串插值
+    ]
+
+    # 代码关键字合并 token — 将常见代码关键字作为独立 token，减少字符级浪费
+    # 按长度从长到短排序（用于贪心匹配）
+    CODE_KEYWORDS = [
+        # Python 关键字（长度 >= 3）
+        'import', 'return', 'while', 'elif', 'else', 'pass',
+        'break', 'continue', 'class', 'def ', 'None', 'True',
+        'False', 'for ', 'from', 'self', 'not ', 'and', 'try',
+        'except', 'raise', 'print', 'int ', 'str ', 'list',
+        'dict', 'set', 'tuple', 'with', 'yield', 'lambda',
+        'global', 'nonlocal', 'async', 'await',
+        # JS/TS/Java 关键字
+        'function', 'const', 'let ', 'var ', 'console.',
+        'return', 'if ', 'else', 'for ', 'while', 'new ',
+        'this.', 'class', 'export', 'import', 'async',
+        # SQL 关键字
+        'SELECT', 'FROM', 'WHERE', 'AND ', 'NOT ',
+        'INSERT', 'INTO', 'UPDATE', 'DELETE', 'CREATE',
+        'TABLE', 'INNER', 'LEFT ', 'RIGHT', 'OUTER',
+        'JOIN ', 'GROUP', 'BY ', 'ORDER', 'NULL',
+        # C++/Rust
+        'std::', 'void', 'auto', 'struct',
+        # Bash
+        'echo', 'sudo',
+        # 中文代码注释高频词
+        '函数', '变量', '返回', '定义', '参数',
+        '调用', '处理', '初始化', '输入', '输出',
+        '数据', '结果', '错误', '成功', '失败',
+        # 通用编程词
+        'name', 'value', 'data', 'item', 'result',
+        'count', 'index', 'key', 'list', 'true', 'false',
+        'null', 'len(', 'type(', 'str(', 'int(',
+        'range(', 'in ', 'is ', 'or ',
+        # 括号语法组合
+        '[]', '{}', '()', 'self.', '__init__',
+        # 常见 API
+        '.append', '.push(', '.length', '.size()',
+        '.get(', '.format(', '.join(', '.split(',
+        '.strip()', '.lower()', '.upper()',
     ]
 
     SPECIAL_TOKENS = ['<PAD>', '<UNK>', '<BOS>', '<EOS>', '<MASK>']
@@ -235,6 +287,24 @@ class CodeTokenizer:
             self.idx_to_char[offset + i] = symbol
         offset += len(self.CODE_SYMBOLS)
 
+        # 代码关键字合并 token（减少字符级浪费）
+        seen_kw = set()
+        for kw in self.CODE_KEYWORDS:
+            if kw in seen_kw or kw in self.char_to_idx:
+                continue
+            seen_kw.add(kw)
+            self.char_to_idx[kw] = offset
+            self.idx_to_char[offset] = kw
+            offset += 1
+
+        # 构建一个按长度从长到短排序的 multi-char token 列表
+        # （用于 encode 时的贪心匹配 — 优先匹配更长的 token）
+        self._merge_tokens = sorted(
+            [tok for tok in self.char_to_idx if len(tok) > 1
+             and not tok.startswith('<')],
+            key=lambda x: -len(x)
+        )
+
         # CJK常用汉字
         cjk_chars = self.GB2312_LEVEL1 + self.GB2312_LEVEL2
         # 去重并保持顺序
@@ -275,9 +345,14 @@ class CodeTokenizer:
         编码文本为token id序列
 
         对代码文本（含中文）:
-        1. 保留所有字符原样编码（含CJK字符）
-        2. 行首缩进用<INDENT>标记
-        3. 注释行用<COMMENT>标记
+        1. 行首缩进用<INDENT>标记
+        2. 注释行用<COMMENT>标记
+        3. **代码关键字贪心匹配** — 优先匹配最长的已知多字符 token
+           （如 `import` `return` `function` `self.`），未匹配时回退到字符级
+
+        相比纯字符级编码：
+        - 一个 `import` 从 6 个 token 变成 1 个 token
+        - 一段 `def hello():` 从 11 个 token 变成 3 个 token
         """
         text = self._preprocess_code(text)
         tokens = []
@@ -300,9 +375,24 @@ class CodeTokenizer:
             if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('<!--'):
                 tokens.append(self.char_to_idx.get('<COMMENT>', self.unk_token_id))
 
-            # 逐字符编码（自动处理ASCII和CJK字符）
-            for char in line:
-                tokens.append(self.char_to_idx.get(char, self.unk_token_id))
+            # 贪心匹配多字符 token — 每次从当前位置尝试最长匹配
+            i = 0
+            line_len = len(line)
+            while i < line_len:
+                matched = False
+                # 尝试匹配最长的已知多字符 token
+                for merge_tok in self._merge_tokens:
+                    tok_len = len(merge_tok)
+                    if tok_len > 1 and i + tok_len <= line_len \
+                            and line[i:i + tok_len] == merge_tok:
+                        tokens.append(self.char_to_idx[merge_tok])
+                        i += tok_len
+                        matched = True
+                        break
+                if not matched:
+                    # 未匹配 — 回退到字符级（ASCII 或 CJK 单字）
+                    tokens.append(self.char_to_idx.get(line[i], self.unk_token_id))
+                    i += 1
 
             tokens.append(self.char_to_idx.get('\n', self.unk_token_id))
 
@@ -320,6 +410,16 @@ class CodeTokenizer:
                 tokens = tokens + [self.pad_token_id] * (max_length - len(tokens))
 
         return tokens
+
+    def count_tokens(self, text: str) -> int:
+        """快速估算文本的 token 数（用于调试和监控 token 压缩率）"""
+        return len(self.encode(text))
+
+    def compression_ratio(self, text: str) -> float:
+        """返回 token 压缩比：原字符数 / token 数（越大越好）"""
+        char_count = len(text)
+        token_count = max(1, self.count_tokens(text) - 2)  # 减去 BOS/EOS
+        return char_count / token_count
 
     def decode(self, token_ids, skip_special_tokens=True):
         """解码token id序列为文本（含中文）"""
@@ -361,6 +461,12 @@ class CodeTokenizer:
         self.bos_token_id = self.char_to_idx.get('<BOS>', 2)
         self.eos_token_id = self.char_to_idx.get('<EOS>', 3)
         self.mask_token_id = self.char_to_idx.get('<MASK>', 4)
+        # 从已加载的词汇表重建合并 token 列表
+        self._merge_tokens = sorted(
+            [tok for tok in self.char_to_idx
+             if len(tok) > 1 and not tok.startswith('<')],
+            key=lambda x: -len(x)
+        )
 
 
 # 向后兼容
@@ -368,7 +474,15 @@ SimpleTokenizer = CodeTokenizer
 
 
 class TextDataset(Dataset):
-    """代码文本数据集（支持中文）"""
+    """代码文本数据集 — 支持两种文件格式
+
+    1) 纯文本格式 (.txt): 每行一条样本
+       `def hello():\n    print('hi')`
+
+    2) 结构化 JSONL 格式 (.jsonl): 每行一个 {"prompt": "...", "response": "..."}
+       用于指令微调 / 对话模型
+       {"prompt": "实现一个加法函数", "response": "def add(a, b):\n    return a + b"}
+    """
 
     def __init__(self, file_path, tokenizer, max_length=512):
         self.tokenizer = tokenizer
@@ -376,7 +490,11 @@ class TextDataset(Dataset):
         self.texts = self._load_texts(file_path)
 
     def _load_texts(self, file_path):
+        """自动检测文件格式并加载"""
         try:
+            if file_path.endswith('.jsonl'):
+                return self._load_jsonl(file_path)
+            # 默认纯文本
             with open(file_path, 'r', encoding='utf-8') as f:
                 texts = [line.strip() for line in f if line.strip()]
             return texts
@@ -384,10 +502,48 @@ class TextDataset(Dataset):
             print(f"Warning: {file_path} not found. Creating empty dataset.")
             return []
 
+    def _load_jsonl(self, file_path):
+        """加载 JSONL 格式 — prompt 与 response 拼接为训练文本"""
+        texts = []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    # 容错：JSON 解析失败时当纯文本
+                    texts.append(line)
+                    continue
+
+                prompt = record.get('prompt', '').strip()
+                response = record.get('response', '').strip()
+                if prompt and response:
+                    # 拼接：prompt + response — 模型会学到 "prompt 后面跟 response"
+                    text = f"{prompt}\n{response}"
+                    texts.append(text)
+                elif prompt:
+                    texts.append(prompt)
+                elif response:
+                    texts.append(response)
+                # 也支持纯文本字段
+                elif 'text' in record:
+                    texts.append(record['text'].strip())
+                else:
+                    # 其他字段：整行当作文本
+                    texts.append(line)
+        return texts
+
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
+        if not _TORCH_AVAILABLE:
+            raise ImportError(
+                "需要 PyTorch 才能使用 TextDataset。"
+                "纯分词请直接调用 CodeTokenizer.encode/decode。"
+            )
         text = self.texts[idx]
         encoding = self.tokenizer.encode(text, max_length=self.max_length)
         return {
@@ -397,7 +553,9 @@ class TextDataset(Dataset):
 
 
 def create_dataloader(dataset, batch_size, shuffle=True, num_workers=0):
-    """创建数据加载器"""
+    """创建数据加载器 — 需要 PyTorch"""
+    if not _TORCH_AVAILABLE:
+        raise ImportError("需要 PyTorch 才能创建 DataLoader。")
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -409,11 +567,15 @@ def create_dataloader(dataset, batch_size, shuffle=True, num_workers=0):
 
 def collate_fn(batch):
     """批处理整理函数"""
+    if not _TORCH_AVAILABLE:
+        raise ImportError("需要 PyTorch 才能使用 collate_fn。")
     input_ids = [item['input_ids'] for item in batch]
     labels = [item['labels'] for item in batch]
 
-    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+        input_ids, batch_first=True, padding_value=0)
+    labels_padded = torch.nn.utils.rnn.pad_sequence(
+        labels, batch_first=True, padding_value=-100)
 
     attention_mask = (input_ids_padded != 0).long()
 

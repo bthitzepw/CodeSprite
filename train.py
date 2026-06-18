@@ -31,6 +31,9 @@ from backends.pytorch import PyTorchBackend, init_model_weights, collect_paramet
 from training.trainer import Trainer
 from src.tokenizer import SimpleTokenizer, TextDataset, create_dataloader
 from src.device import resolve_device, print_device_info, warn_cpu_training, set_seed
+
+
+def prepare_data(config):
     """准备训练/验证数据集和 DataLoader"""
     print("Initializing tokenizer...")
     tokenizer = SimpleTokenizer(vocab_size=config.model.vocab_size)
