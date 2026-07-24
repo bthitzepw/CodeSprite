@@ -279,11 +279,20 @@ class InteractionDB:
             conn.close()
             return record_id
 
+    ALLOWED_LEARNING_COLUMNS = {
+        'trigger_type', 'num_samples', 'epochs', 'train_loss_before',
+        'train_loss_after', 'val_loss_before', 'val_loss_after',
+        'perplexity_before', 'perplexity_after', 'status', 'started_at',
+        'completed_at', 'checkpoint_path', 'notes'
+    }
+
     def update_learning_record(self, record_id: int, **kwargs):
         with self.lock:
             conn = self._get_conn()
             cursor = conn.cursor()
             for k, v in kwargs.items():
+                if k not in self.ALLOWED_LEARNING_COLUMNS:
+                    raise ValueError(f"非法字段名: {k}")
                 cursor.execute(f'UPDATE learning_history SET {k} = ? WHERE id = ?', (v, record_id))
             conn.commit()
             conn.close()
@@ -682,7 +691,7 @@ class AutoLearner:
             tokenizer = SimpleTokenizer(vocab_size=mc.vocab_size)
 
             # 3. 加载已存在的 checkpoint
-            checkpoint_dir = 'checkpoints'
+            checkpoint_dir = config_dict.get('system', {}).get('checkpoint_dir', 'checkpoints')
             best_path = os.path.join(checkpoint_dir, 'best_model.pt')
             train_loss_before = 0.0
             val_loss_before = 0.0
@@ -738,7 +747,8 @@ class AutoLearner:
                 return {'input_ids': padded, 'labels': padded.clone()}
 
             dataset = _IncrementalDataset(training_texts, tokenizer, mc.max_seq_length)
-            loader = DataLoader(dataset, batch_size=8, shuffle=True,
+            batch_size = config_dict.get('training', {}).get('batch_size', 8)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                                 num_workers=0, collate_fn=_collate)
 
             # 6. 训练循环（PyTorch 优化器 + IR 模型）

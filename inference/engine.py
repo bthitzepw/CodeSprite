@@ -92,7 +92,7 @@ class InferenceEngine:
                 if hasattr(first_block, 'params'):
                     return len(first_block.params) > 0
             return True
-        except:
+        except AttributeError:
             return True
 
     def _is_ir_model(self) -> bool:
@@ -146,25 +146,36 @@ class InferenceEngine:
 
         # Top-K 过滤
         if top_k is not None and top_k > 0 and top_k < len(logits_np):
-            indices = (-logits_np).argsort()
-            mask = np.ones_like(logits_np, dtype=bool)
-            mask[indices[top_k:]] = False
+            indices = np.argpartition(-logits_np, top_k)[:top_k]
+            mask = np.zeros_like(logits_np, dtype=bool)
+            mask[indices] = True
             logits_np[~mask] = float('-inf')
 
         # Top-P (nucleus) 过滤
         if top_p is not None and top_p < 1.0:
-            sorted_indices = (-logits_np).argsort()
-            sorted_logits = logits_np[sorted_indices]
-            sorted_logits = sorted_logits - sorted_logits.max()
-            sorted_probs = np.exp(sorted_logits) / np.exp(sorted_logits).sum()
-            cumsum = np.cumsum(sorted_probs)
-            cutoff_idx = int((cumsum > top_p).argmax()) + 1
-            if cutoff_idx < len(sorted_indices):
-                logits_np[sorted_indices[cutoff_idx:]] = float('-inf')
+            valid_mask = logits_np != float('-inf')
+            valid_logits = logits_np[valid_mask]
+            valid_indices = np.where(valid_mask)[0]
 
-        # Softmax
+            if len(valid_logits) == 0:
+                return int(np.random.randint(len(logits_np)))
+
+            valid_logits_stable = valid_logits - valid_logits.max()
+            valid_probs = np.exp(valid_logits_stable)
+            valid_probs = valid_probs / valid_probs.sum()
+            cumsum = np.cumsum(valid_probs)
+            cutoff_idx = int((cumsum > top_p).argmax()) + 1
+
+            if cutoff_idx < len(valid_indices):
+                to_mask = valid_indices[cutoff_idx:]
+                logits_np[to_mask] = float('-inf')
+
+        # 数值稳定的 Softmax
         logits_np = logits_np - logits_np.max()
-        probs = np.exp(logits_np) / np.exp(logits_np).sum()
+        exp_logits = np.exp(logits_np)
+        exp_logits = np.clip(exp_logits, 1e-10, None)
+        probs = exp_logits / exp_logits.sum()
+        probs = probs / probs.sum()
 
         # 采样
         next_token = int(np.random.choice(len(probs), p=probs))

@@ -33,7 +33,6 @@ class Layer:
     def train(self, mode: bool = True):
         """递归切换训练/推理模式（包括所有子层）"""
         self._training = mode
-        # 递归处理作为属性的子层
         for attr_name in dir(self):
             if attr_name.startswith('_'):
                 continue
@@ -41,9 +40,8 @@ class Layer:
                 attr = getattr(self, attr_name)
                 if isinstance(attr, Layer):
                     attr.train(mode)
-            except:
+            except AttributeError:
                 pass
-        # 递归处理 blocks 列表
         if hasattr(self, 'blocks'):
             for block in self.blocks:
                 if isinstance(block, Layer):
@@ -259,6 +257,14 @@ class Attention(Layer):
         q = backend.reshape_for_heads(q, batch_size, seq_len, self.num_heads, self.head_dim)
         k = backend.reshape_for_heads(k, batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = backend.reshape_for_heads(v, batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        # 应用 RoPE 旋转位置编码
+        if self.use_rope:
+            past_len = kv_cache[0].shape[2] if kv_cache is not None else 0
+            cos, sin = backend.rope_precompute(past_len + seq_len, self.head_dim, 10000.0)
+            cos = cos[past_len:past_len + seq_len]
+            sin = sin[past_len:past_len + seq_len]
+            q, k = backend.rope_apply(q, k, cos, sin)
 
         # KV-Cache: 拼接历史 K/V（沿序列维度 dim=2）
         if kv_cache is not None:

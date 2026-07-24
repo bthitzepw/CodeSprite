@@ -293,62 +293,13 @@ class PyTorchBackend(Backend):
 
     def get_state_dict(self, model) -> Dict[str, Any]:
         """从 IR 模型收集所有参数，flat key 格式"""
-        state = {}
-        self._collect_params(model, "", state)
-        return state
-
-    def _collect_params(self, obj, prefix: str, state: Dict):
-        """递归收集参数"""
-        from ir.layers import Layer
-        if isinstance(obj, Layer):
-            for key, param in obj.params.items():
-                full_key = f"{prefix}{key}" if prefix else key
-                state[full_key] = param
-            # 递归子层
-            for attr_name in dir(obj):
-                if attr_name.startswith('_'):
-                    continue
-                try:
-                    attr = getattr(obj, attr_name)
-                    if isinstance(attr, Layer):
-                        sub_prefix = f"{prefix}{attr.name}." if prefix else f"{attr.name}."
-                        self._collect_params(attr, sub_prefix, state)
-                except:
-                    pass
-            # 处理 blocks 列表
-            if hasattr(obj, 'blocks'):
-                for i, block in enumerate(obj.blocks):
-                    sub_prefix = f"{prefix}block_{i}." if prefix else f"block_{i}."
-                    self._collect_params(block, sub_prefix, state)
+        from ir.utils import collect_params
+        return collect_params(model)
 
     def load_state_dict(self, model, state_dict: Dict[str, Any]) -> None:
         """从 flat key 字典加载参数到 IR 模型"""
-        from ir.layers import Layer
-
-        def _assign_params(obj, prefix: str, sd: Dict):
-            if isinstance(obj, Layer):
-                # 加载当前层的直接参数
-                for key in list(obj.params.keys()):
-                    full_key = f"{prefix}{key}" if prefix else key
-                    if full_key in sd:
-                        obj.params[key] = sd[full_key]
-                # 递归子层
-                for attr_name in dir(obj):
-                    if attr_name.startswith('_'):
-                        continue
-                    try:
-                        attr = getattr(obj, attr_name)
-                        if isinstance(attr, Layer):
-                            sub_prefix = f"{prefix}{attr.name}." if prefix else f"{attr.name}."
-                            _assign_params(attr, sub_prefix, sd)
-                    except:
-                        pass
-                if hasattr(obj, 'blocks'):
-                    for i, block in enumerate(obj.blocks):
-                        sub_prefix = f"{prefix}block_{i}." if prefix else f"block_{i}."
-                        _assign_params(block, sub_prefix, sd)
-
-        _assign_params(model, "", state_dict)
+        from ir.utils import load_state_dict
+        load_state_dict(model, state_dict)
 
     def multinomial(self, probs, num_samples: int = 1):
         return torch.multinomial(probs, num_samples=num_samples)

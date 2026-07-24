@@ -153,14 +153,14 @@ class NumPyBackend(Backend):
                 mask = mask[np.newaxis, np.newaxis, :, :]
             elif mask.ndim == 3:
                 mask = mask[:, np.newaxis, :, :]
-            attn_scores = np.where(mask == 0, -1e10, attn_scores)
+            attn_scores = np.where(~mask, -1e10, attn_scores)
 
         attn_weights = self.softmax(attn_scores, dim=-1)
         # NumPy 不做 dropout
         return np.matmul(attn_weights, v)
 
     def causal_mask(self, seq_len: int) -> Any:
-        return np.tril(np.ones((seq_len, seq_len), dtype=np.float32))
+        return np.tril(np.ones((seq_len, seq_len), dtype=bool))
 
     def concat(self, a, b, dim: int = 0):
         """沿指定维度拼接两个数组（用于 KV-Cache 等场景）"""
@@ -251,58 +251,16 @@ class NumPyBackend(Backend):
         return state_dict
 
     def get_state_dict(self, model) -> Dict[str, Any]:
-        from ir.layers import Layer
-        state = {}
-
-        def _collect(obj, prefix):
-            if isinstance(obj, Layer):
-                for key, param in obj.params.items():
-                    full_key = f"{prefix}{key}" if prefix else key
-                    if param is not None:
-                        state[full_key] = param
-                for attr_name in dir(obj):
-                    if attr_name.startswith('_'):
-                        continue
-                    try:
-                        attr = getattr(obj, attr_name)
-                        if isinstance(attr, Layer) and attr is not obj:
-                            sub_prefix = f"{prefix}{attr.name}." if prefix else f"{attr.name}."
-                            _collect(attr, sub_prefix)
-                    except:
-                        pass
-                if hasattr(obj, 'blocks'):
-                    for i, block in enumerate(obj.blocks):
-                        sub_prefix = f"{prefix}block_{i}." if prefix else f"block_{i}."
-                        _collect(block, sub_prefix)
-
-        _collect(model, "")
-        return state
+        from ir.utils import collect_params
+        return collect_params(model)
 
     def load_state_dict(self, model, state_dict: Dict[str, Any]) -> None:
-        from ir.layers import Layer
+        from ir.utils import load_state_dict
 
-        def _assign(obj, prefix):
-            if isinstance(obj, Layer):
-                for key in list(obj.param_shapes().keys()):
-                    full_key = f"{prefix}{key}" if prefix else key
-                    if full_key in state_dict:
-                        obj.params[key] = np.asarray(state_dict[full_key], dtype=np.float32)
-                for attr_name in dir(obj):
-                    if attr_name.startswith('_'):
-                        continue
-                    try:
-                        attr = getattr(obj, attr_name)
-                        if isinstance(attr, Layer) and attr is not obj:
-                            sub_prefix = f"{prefix}{attr.name}." if prefix else f"{attr.name}."
-                            _assign(attr, sub_prefix)
-                    except:
-                        pass
-                if hasattr(obj, 'blocks'):
-                    for i, block in enumerate(obj.blocks):
-                        sub_prefix = f"{prefix}block_{i}." if prefix else f"block_{i}."
-                        _assign(block, sub_prefix)
+        def _convert_fn(key, value):
+            return np.asarray(value, dtype=np.float32)
 
-        _assign(model, "")
+        load_state_dict(model, state_dict, transform_fn=_convert_fn)
 
     def multinomial(self, probs, num_samples: int = 1):
         # 从概率分布中采样
